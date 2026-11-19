@@ -135,6 +135,7 @@ def contains_banned(text: str) -> str | None:
 async def ai_reply(prompt: str, history: list[dict] | None = None) -> str:
     """Запрос к любому OpenAI-совместимому API."""
     import json
+    import urllib.error
     import urllib.request
 
     messages = [{"role": "system", "content": AI_SYSTEM}]
@@ -157,10 +158,36 @@ async def ai_reply(prompt: str, history: list[dict] | None = None) -> str:
             "Content-Type": "application/json",
         },
     )
+    if not AI_API_KEY:
+        return ("ИИ не настроен: не задан AI_API_KEY. "
+                "Откройте Render → Environment и добавьте ключ, либо поставьте AI_ENABLED=0.")
+
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read().decode())
         return data["choices"][0]["message"]["content"].strip()
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "ignore")[:300]
+        except Exception:
+            pass
+        log.error("AI HTTP %s: %s", e.code, body)
+        hints = {
+            400: "API не принял запрос — скорее всего неверное имя модели AI_MODEL.",
+            401: "Ключ AI_API_KEY неверный или не подходит к этому AI_BASE_URL.",
+            403: "Доступ запрещён: ключ без прав или модель недоступна для него.",
+            404: "Не найдено: проверьте AI_BASE_URL (должен заканчиваться на /v1) и AI_MODEL.",
+            429: "Лимит запросов исчерпан. Подождите или смените модель.",
+            500: "Сбой на стороне сервиса ИИ. Попробуйте позже.",
+            502: "Сервис ИИ недоступен. Попробуйте позже.",
+            503: "Сервис ИИ перегружен. Попробуйте позже.",
+        }
+        hint = hints.get(e.code, "Проверьте AI_BASE_URL, AI_API_KEY и AI_MODEL в Environment.")
+        return f"Ошибка ИИ ({e.code}). {hint}"
+    except urllib.error.URLError as e:
+        log.error("AI network error: %s", e)
+        return "Нет связи с сервисом ИИ. Проверьте AI_BASE_URL в Environment."
     except Exception as e:
         log.exception("AI error")
         return f"Не получилось получить ответ: {type(e).__name__}"
