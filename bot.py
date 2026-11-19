@@ -13,10 +13,12 @@
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
 import time
+from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from pathlib import Path
 
@@ -51,9 +53,9 @@ AI_API_KEY = os.getenv("AI_API_KEY", "")
 AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")
 AI_SYSTEM = os.getenv(
     "AI_SYSTEM",
-    "Ты — дружелюбный и краткий ассистент в Telegram. Отвечай по-русски, "
-    "по делу, без лишних вступлений. Если вопрос требует данных, которых нет, — "
-    "честно скажи об этом.",
+    "Ты — личный секретарь. Отвечай по-русски, кратко и по делу, обращайся на «вы». "
+    "Помогай с планами, делами, заметками и напоминаниями. Если данных не хватает — "
+    "задай один короткий уточняющий вопрос.",
 )
 
 BANNED_WORDS = [w.strip().lower() for w in os.getenv(
@@ -89,6 +91,15 @@ chat_settings: dict[int, dict] = defaultdict(lambda: {"ai": True})
 flood: dict[tuple[int, int], deque] = defaultdict(lambda: deque(maxlen=50))
 # (chat_id, user_id) -> последний текст (антиповтор)
 last_msg: dict[tuple[int, int], str] = {}
+# ─── состояние секретаря ───
+# chat_id -> list[{"role","content"}] — память диалога
+dialog_history: dict[int, list] = defaultdict(list)
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "16"))
+# chat_id -> list[str] — заметки
+notes: dict[int, list] = defaultdict(list)
+# список напоминаний: (when_ts, chat_id, text)
+reminders: list[dict] = []
+
 # message_id -> {chat_id, user_id} для кнопок
 mute_candidates: dict[int, dict] = {}
 
@@ -356,7 +367,12 @@ async def on_text(message: Message):
     if message.chat.type == ChatType.PRIVATE:
         if OWNER_ID and uid != OWNER_ID:
             return
-        answer = await ai_reply(text)
+        hist = dialog_history[chat_id]
+        answer = await ai_reply(text, hist)
+        hist.append({"role": "user", "content": text})
+        hist.append({"role": "assistant", "content": answer})
+        if len(hist) > HISTORY_LIMIT * 2:
+            del hist[: len(hist) - HISTORY_LIMIT * 2]
         await message.answer(answer)
         return
 
@@ -375,6 +391,116 @@ async def on_text(message: Message):
     if addressed and text:
         answer = await ai_reply(text)
         await message.reply(answer)
+
+
+# ─────────────────────────── секретарь: заметки и напоминания ───────────────────────────
+
+@router.message(Command("note"))
+async def cmd_note(message: Message, command: CommandObject):
+    text = (command.args or "").strip()
+    if not text:
+        await message.answer("Использование: <code>/note купить хлеб</code>")
+        return
+    notes[message.chat.id].append(text)
+    await message.answer(f"Записал. Всего заметок: {len(notes[message.chat.id])}")
+
+
+@router.message(Command("notes"))
+async def cmd_notes(message: Message):
+    items = notes[message.chat.id]
+    if not items:
+        await message.answer("Заметок пока нет.")
+        return
+    body = "\n".join(f"{i}. {t}" for i, t in enumerate(items, 1))
+    await message.answer(f"<b>Заметки</b>\n{body}")
+
+
+@router.message(Command("delnote"))
+async def cmd_delnote(message: Message, command: CommandObject):
+    try:
+        idx = int((command.args or "").strip())
+    except ValueError:
+        await message.answer("Укажите номер заметки: <code>/delnote 2</code>")
+        return
+    items = notes[message.chat.id]
+    if 1 <= idx <= len(items):
+        removed = items.pop(idx - 1)
+        await message.answer(f"Удалил: {removed}")
+    else:
+        await message.answer("Такой заметки нет.")
+
+
+def parse_when(arg: str) -> tuple[int, str] | None:
+    """Понимает: 10m, 2h, 1d, 19:30, или 19:30 20.11"""
+    arg = arg.strip()
+    m = re.fullmatch(r"(\d+)([mhd])", arg)
+    now = datetime.now()
+    if m:
+        num, unit = int(m.group(1)), m.group(2)
+        delta = {"m": timedelta(minutes=num), "h": timedelta(hours=num), "d": timedelta(days=num)}[unit]
+        return int((now + delta).timestamp()), ""
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})(?:\s+(\d{1,2})\.(\d{1,2}))?", arg)
+    if m:
+        hh, mm = int(m.group(1)), int(m.group(2))
+        if m.group(3):
+            day, month = int(m.group(3)), int(m.group(4))
+            target = now.replace(day=day, month=month, hour=hh, minute=mm, second=0, microsecond=0)
+        else:
+            target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if target <= now:
+                target += timedelta(days=1)
+        return int(target.timestamp()), target.strftime("%d.%m %H:%M")
+    return None
+
+
+@router.message(Command("remind"))
+async def cmd_remind(message: Message, command: CommandObject):
+    args = (command.args or "").strip()
+    if not args or " " not in args:
+        await message.answer(
+            "Формат: <code>/remind 30m позвонить маме</code>\n"
+            "Можно так: <code>/remind 19:30 встреча</code> или <code>/remind 19:30 20.11 встреча</code>"
+        )
+        return
+    when_raw, text = args.split(" ", 1)
+    parsed = parse_when(when_raw)
+    if not parsed:
+        await message.answer("Не понял время. Примеры: 30m, 2h, 19:30, 19:30 20.11")
+        return
+    ts, human = parsed
+    reminders.append({"when": ts, "chat_id": message.chat.id, "text": text.strip()})
+    human = human or datetime.fromtimestamp(ts).strftime("%d.%m %H:%M")
+    await message.answer(f"Напомню {human}: {text.strip()}")
+
+
+@router.message(Command("reminders"))
+async def cmd_reminders(message: Message):
+    items = [r for r in reminders if r["chat_id"] == message.chat.id]
+    if not items:
+        await message.answer("Напоминаний нет.")
+        return
+    items.sort(key=lambda r: r["when"])
+    body = "\n".join(
+        f"• {datetime.fromtimestamp(r['when']).strftime('%d.%m %H:%M')} — {r['text']}" for r in items
+    )
+    await message.answer(f"<b>Напоминания</b>\n{body}")
+
+
+async def reminder_loop():
+    """Каждые 20 секунд проверяет, не пора ли что-то напомнить."""
+    while True:
+        try:
+            now = time.time()
+            due = [r for r in reminders if r["when"] <= now]
+            for r in due:
+                reminders.remove(r)
+                try:
+                    await bot.send_message(r["chat_id"], f"Напоминаю: {r['text']}")
+                except Exception:
+                    log.warning("не удалось отправить напоминание")
+        except Exception:
+            log.exception("reminder loop error")
+        await asyncio.sleep(20)
 
 
 # ─────────────────────────── меню команд ───────────────────────────
@@ -413,12 +539,17 @@ async def set_commands():
         BotCommand(command="ban", description="Забанить"),
         BotCommand(command="pin", description="Закрепить сообщение"),
         BotCommand(command="id", description="Мои ID"),
+        BotCommand(command="note", description="Записать заметку"),
+        BotCommand(command="notes", description="Показать заметки"),
+        BotCommand(command="remind", description="Напоминание: /remind 30m текст"),
+        BotCommand(command="reminders", description="Список напоминаний"),
     ])
 
 
 async def main():
     runner = await start_health_server()
     await set_commands()
+    asyncio.create_task(reminder_loop())
     log.info("Бот запущен")
     try:
         await dp.start_polling(bot)
