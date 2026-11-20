@@ -168,7 +168,7 @@ def get_giga_token(force: bool = False) -> str:
     import json as _json
     import time as _time
     import urllib.parse
-    import urllib.request as _req
+    import urllib.request as _req , context=_SSL_CTX
     import uuid
 
     now = _time.time()
