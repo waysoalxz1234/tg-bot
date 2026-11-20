@@ -29,13 +29,13 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, ChatPermissions, BotCommand
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiohttp import web as aio_web
+
 import ssl
 
-# --- SSL-контекст для GigaChat (сертификаты Сбера) ---
+# ─── SSL-контекст для GigaChat (сертификаты Сбера) ───
 _SSL_CTX = ssl.create_default_context()
 _SSL_CTX.check_hostname = False
 _SSL_CTX.verify_mode = ssl.CERT_NONE
-# -----------------------------------------------------
 
 # ─────────────────────────── конфиг ───────────────────────────
 
@@ -92,22 +92,15 @@ dp.include_router(router)
 
 # ─────────────────────────── состояние ───────────────────────────
 
-# chat_id -> {ai: bool}
 chat_settings: dict[int, dict] = defaultdict(lambda: {"ai": True})
-# (chat_id, user_id) -> deque[timestamps]
 flood: dict[tuple[int, int], deque] = defaultdict(lambda: deque(maxlen=50))
-# (chat_id, user_id) -> последний текст (антиповтор)
 last_msg: dict[tuple[int, int], str] = {}
-# ─── состояние секретаря ───
-# chat_id -> list[{"role","content"}] — память диалога
+
 dialog_history: dict[int, list] = defaultdict(list)
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "16"))
-# chat_id -> list[str] — заметки
 notes: dict[int, list] = defaultdict(list)
-# список напоминаний: (when_ts, chat_id, text)
 reminders: list[dict] = []
 
-# message_id -> {chat_id, user_id} для кнопок
 mute_candidates: dict[int, dict] = {}
 
 # ─────────────────────────── утилиты ───────────────────────────
@@ -140,8 +133,6 @@ def contains_banned(text: str) -> str | None:
 
 
 # ─── GigaChat: получение и обновление токена доступа ───
-# GigaChat выдаёт access_token на 30 минут. Держим его в памяти
-# и обновляем заранее.
 _giga_token: dict = {"value": "", "expires": 0}
 
 
@@ -193,7 +184,6 @@ def get_giga_token(force: bool = False) -> str:
             "Authorization": f"Basic {auth}",
         },
     )
-    # ✅ Здесь добавлен context=_SSL_CTX — это исправляет SSL-ошибку
     with _req.urlopen(request, timeout=30, context=_SSL_CTX) as resp:
         payload = _json.loads(resp.read().decode())
     token = payload.get("access_token", "")
@@ -248,21 +238,17 @@ async def ai_reply(prompt: str, history: list[dict] | None = None) -> str:
         token = await asyncio.to_thread(get_giga_token) if use_giga else AI_API_KEY
     except Exception as e:
         log.exception("GigaChat auth error")
-        # ✅ Теперь бот пришлёт понятную причину ошибки
         return f"Не удалось авторизоваться в GigaChat: {type(e).__name__}: {e}"
 
     try:
         req = build_request(token)
         try:
-            # ✅ Первый запрос с context=_SSL_CTX
             with urllib.request.urlopen(req, timeout=60, context=_SSL_CTX) as resp:
                 data = json.loads(resp.read().decode())
         except urllib.error.HTTPError as e:
-            # токен мог протухнуть раньше времени — обновляем один раз
             if use_giga and e.code in (401, 403):
                 token = await asyncio.to_thread(get_giga_token, True)
                 req = build_request(token)
-                # ✅ Повторный запрос тоже с context=_SSL_CTX
                 with urllib.request.urlopen(req, timeout=60, context=_SSL_CTX) as resp:
                     data = json.loads(resp.read().decode())
             else:
@@ -279,7 +265,7 @@ async def ai_reply(prompt: str, history: list[dict] | None = None) -> str:
             400: "API не принял запрос — скорее всего неверное имя модели AI_MODEL.",
             401: "Ключ неверный или не подходит к этому AI_BASE_URL.",
             403: "Доступ запрещён: ключ без прав или модель недоступна для него.",
-            404: "Не найдено: проверьте AI_BASE_URL (должен заканчиваться на /v1) и AI_MODEL.",
+            404: "Не найдено: проверьте AI_BASE_URL и AI_MODEL.",
             429: "Лимит запросов исчерпан. Подождите или смените модель.",
             500: "Сбой на стороне сервиса ИИ. Попробуйте позже.",
             502: "Сервис ИИ недоступен. Попробуйте позже.",
@@ -344,4 +330,360 @@ async def cmd_ai(message: Message, command: CommandObject):
 
 
 @router.message(Command("mute"))
-async def cmd_mute(message: Message,
+async def cmd_mute(message: Message, command: CommandObject):
+    if not await is_admin(message):
+        return
+    uid, name = target_user(message)
+    args = (command.args or "").strip()
+    if not uid:
+        parts = args.split()
+        if message.chat.type == ChatType.PRIVATE and parts and parts[0].lstrip("-").isdigit():
+            uid = int(parts[0])
+            name = f"user {uid}"
+            args = " ".join(parts[1:])
+        else:
+            await message.answer("Ответьте на сообщение нарушителя.")
+            return
+    minutes = int(args or MUTE_MINUTES)
+    until = int(time.time()) + minutes * 60
+    await bot.restrict_chat_member(
+        message.chat.id, uid,
+        permissions=ChatPermissions(can_send_messages=False),
+        until_date=until,
+    )
+    await message.answer(f"{name} в муте на {minutes} мин.")
+
+
+@router.message(Command("unmute"))
+async def cmd_unmute(message: Message):
+    if not await is_admin(message):
+        return
+    uid, name = target_user(message)
+    if not uid:
+        await message.answer("Ответьте на сообщение пользователя.")
+        return
+    await bot.restrict_chat_member(
+        message.chat.id, uid,
+        permissions=ChatPermissions(
+            can_send_messages=True, can_send_media_messages=True,
+            can_send_other_messages=True, can_add_web_page_previews=True,
+        ),
+    )
+    await message.answer(f"С {name} мут снят.")
+
+
+@router.message(Command("kick"))
+async def cmd_kick(message: Message):
+    if not await is_admin(message):
+        return
+    uid, name = target_user(message)
+    if not uid:
+        await message.answer("Ответьте на сообщение пользователя.")
+        return
+    await bot.ban_chat_member(message.chat.id, uid)
+    await bot.unban_chat_member(message.chat.id, uid)
+    await message.answer(f"{name} удалён из чата.")
+
+
+@router.message(Command("ban"))
+async def cmd_ban(message: Message):
+    if not await is_admin(message):
+        return
+    uid, name = target_user(message)
+    if not uid:
+        await message.answer("Ответьте на сообщение пользователя.")
+        return
+    await bot.ban_chat_member(message.chat.id, uid)
+    await message.answer(f"{name} забанен.")
+
+
+@router.message(Command("pin"))
+async def cmd_pin(message: Message, command_obj: CommandObject):
+    if not await is_admin(message):
+        return
+    if not message.reply_to_message:
+        if (command_obj.args or "").strip():
+            sent = await message.answer(command_obj.args.strip())
+            await bot.pin_chat_message(message.chat.id, sent.message_id)
+            await message.answer("Закреплено.")
+            return
+        await message.answer(
+            "Ответьте на сообщение, которое нужно закрепить, "
+            "или напишите текст: <code>/pin важное объявление</code>"
+        )
+        return
+    await bot.pin_chat_message(message.chat.id, message.reply_to_message.message_id)
+    await message.answer("Закреплено.")
+
+
+# ─────────────────────────── модерация ───────────────────────────
+
+@router.message(F.new_chat_members)
+async def on_join(message: Message):
+    for u in message.new_chat_members:
+        if u.is_bot:
+            continue
+        try:
+            await message.answer(WELCOME.format(name=u.full_name))
+        except Exception:
+            pass
+
+
+@router.message(F.left_chat_member)
+async def on_leave(message: Message):
+    pass
+
+
+@router.message(F.text)
+async def on_text(message: Message):
+    if not message.text or not message.from_user or message.from_user.is_bot:
+        return
+
+    chat_id = message.chat.id
+    uid = message.from_user.id
+    key = (chat_id, uid)
+    text = message.text.strip()
+
+    if text.startswith("/"):
+        return
+
+    # ── 1. стоп-слова в группах
+    if message.chat.type != ChatType.PRIVATE:
+        bad = contains_banned(text)
+        if bad:
+            if await is_admin(message):
+                return
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            await message.answer(
+                f"{message.from_user.full_name}, такие сообщения здесь неуместны.",
+                disable_notification=True,
+            )
+            return
+
+    # ── 2. антифлуд и антиповтор (только группы)
+    if message.chat.type != ChatType.PRIVATE and not await is_admin(message):
+        now = time.time()
+        q = flood[key]
+        q.append(now)
+        while q and now - q[0] > FLOOD_WINDOW:
+            q.popleft()
+        repeated = last_msg.get(key) == text
+        last_msg[key] = text
+
+        if len(q) >= FLOOD_LIMIT or (repeated and len(q) >= 3):
+            try:
+                await bot.restrict_chat_member(
+                    chat_id, uid,
+                    permissions=ChatPermissions(can_send_messages=False),
+                    until_date=int(now) + MUTE_MINUTES * 60,
+                )
+                await message.answer(
+                    f"{message.from_user.full_name} — слишком часто. "
+                    f"Мут на {MUTE_MINUTES} мин."
+                )
+            except Exception:
+                log.warning("не удалось ограничить пользователя")
+            flood[key].clear()
+            return
+
+    # ── 3. ответы ИИ
+    if not AI_ENABLED:
+        return
+
+    if message.chat.type == ChatType.PRIVATE:
+        if OWNER_ID and uid != OWNER_ID:
+            return
+        hist = dialog_history[chat_id]
+        answer = await ai_reply(text, hist)
+        hist.append({"role": "user", "content": text})
+        hist.append({"role": "assistant", "content": answer})
+        if len(hist) > HISTORY_LIMIT * 2:
+            del hist[: len(hist) - HISTORY_LIMIT * 2]
+        await message.answer(answer)
+        return
+
+    if not chat_settings[chat_id]["ai"]:
+        return
+
+    me = await bot.me()
+    addressed = False
+    if message.reply_to_message and message.reply_to_message.from_user:
+        if message.reply_to_message.from_user.id == me.id:
+            addressed = True
+    if f"@{me.username}" in text:
+        addressed = True
+        text = text.replace(f"@{me.username}", "").strip()
+
+    if addressed and text:
+        answer = await ai_reply(text)
+        await message.reply(answer)
+
+
+# ─────────────── секретарь: заметки и напоминания ───────────────
+
+@router.message(Command("note"))
+async def cmd_note(message: Message, command: CommandObject):
+    text = (command.args or "").strip()
+    if not text:
+        await message.answer("Использование: <code>/note купить хлеб</code>")
+        return
+    notes[message.chat.id].append(text)
+    await message.answer(f"Записал. Всего заметок: {len(notes[message.chat.id])}")
+
+
+@router.message(Command("notes"))
+async def cmd_notes(message: Message):
+    items = notes[message.chat.id]
+    if not items:
+        await message.answer("Заметок пока нет.")
+        return
+    body = "\n".join(f"{i}. {t}" for i, t in enumerate(items, 1))
+    await message.answer(f"<b>Заметки</b>\n{body}")
+
+
+@router.message(Command("delnote"))
+async def cmd_delnote(message: Message, command: CommandObject):
+    try:
+        idx = int((command.args or "").strip())
+    except ValueError:
+        await message.answer("Укажите номер заметки: <code>/delnote 2</code>")
+        return
+    items = notes[message.chat.id]
+    if 1 <= idx <= len(items):
+        removed = items.pop(idx - 1)
+        await message.answer(f"Удалил: {removed}")
+    else:
+        await message.answer("Такой заметки нет.")
+
+
+def parse_when(arg: str) -> tuple[int, str] | None:
+    """Понимает: 10m, 2h, 1d, 19:30, или 19:30 20.11"""
+    arg = arg.strip()
+    m = re.fullmatch(r"(\d+)([mhd])", arg)
+    now = datetime.now()
+    if m:
+        num, unit = int(m.group(1)), m.group(2)
+        delta = {"m": timedelta(minutes=num), "h": timedelta(hours=num), "d": timedelta(days=num)}[unit]
+        return int((now + delta).timestamp()), ""
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})(?:\s+(\d{1,2})\.(\d{1,2}))?", arg)
+    if m:
+        hh, mm = int(m.group(1)), int(m.group(2))
+        if m.group(3):
+            day, month = int(m.group(3)), int(m.group(4))
+            target = now.replace(day=day, month=month, hour=hh, minute=mm, second=0, microsecond=0)
+        else:
+            target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if target <= now:
+                target += timedelta(days=1)
+        return int(target.timestamp()), target.strftime("%d.%m %H:%M")
+    return None
+
+
+@router.message(Command("remind"))
+async def cmd_remind(message: Message, command: CommandObject):
+    args = (command.args or "").strip()
+    if not args or " " not in args:
+        await message.answer(
+            "Формат: <code>/remind 30m позвонить маме</code>\n"
+            "Можно так: <code>/remind 19:30 встреча</code> или <code>/remind 19:30 20.11 встреча</code>"
+        )
+        return
+    when_raw, text = args.split(" ", 1)
+    parsed = parse_when(when_raw)
+    if not parsed:
+        await message.answer("Не понял время. Примеры: 30m, 2h, 19:30, 19:30 20.11")
+        return
+    ts, human = parsed
+    reminders.append({"when": ts, "chat_id": message.chat.id, "text": text.strip()})
+    human = human or datetime.fromtimestamp(ts).strftime("%d.%m %H:%M")
+    await message.answer(f"Напомню {human}: {text.strip()}")
+
+
+@router.message(Command("reminders"))
+async def cmd_reminders(message: Message):
+    items = [r for r in reminders if r["chat_id"] == message.chat.id]
+    if not items:
+        await message.answer("Напоминаний нет.")
+        return
+    items.sort(key=lambda r: r["when"])
+    body = "\n".join(
+        f"• {datetime.fromtimestamp(r['when']).strftime('%d.%m %H:%M')} — {r['text']}" for r in items
+    )
+    await message.answer(f"<b>Напоминания</b>\n{body}")
+
+
+async def reminder_loop():
+    """Каждые 20 секунд проверяет, не пора ли что-то напомнить."""
+    while True:
+        try:
+            now = time.time()
+            due = [r for r in reminders if r["when"] <= now]
+            for r in due:
+                reminders.remove(r)
+                try:
+                    await bot.send_message(r["chat_id"], f"Напоминаю: {r['text']}")
+                except Exception:
+                    log.warning("не удалось отправить напоминание")
+        except Exception:
+            log.exception("reminder loop error")
+        await asyncio.sleep(20)
+
+
+# ─────────────────── health-check для Render ───────────────────
+
+async def _health(request):
+    return aio_web.Response(text="ok")
+
+async def start_health_server():
+    port = int(os.getenv("PORT", "0") or 0)
+    if not port:
+        return None
+    app = aio_web.Application()
+    app.router.add_get("/", _health)
+    app.router.add_get("/healthz", _health)
+    runner = aio_web.AppRunner(app)
+    await runner.setup()
+    site = aio_web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info("health-сервер слушает порт %s", port)
+    return runner
+
+
+async def set_commands():
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Начать"),
+        BotCommand(command="rules", description="Правила чата"),
+        BotCommand(command="ai", description="ИИ-ответы: on / off"),
+        BotCommand(command="mute", description="Мут (реплай)"),
+        BotCommand(command="unmute", description="Снять мут"),
+        BotCommand(command="kick", description="Удалить из чата"),
+        BotCommand(command="ban", description="Забанить"),
+        BotCommand(command="pin", description="Закрепить сообщение"),
+        BotCommand(command="id", description="Мои ID"),
+        BotCommand(command="note", description="Записать заметку"),
+        BotCommand(command="notes", description="Показать заметки"),
+        BotCommand(command="remind", description="Напоминание: /remind 30m текст"),
+        BotCommand(command="reminders", description="Список напоминаний"),
+    ])
+
+
+async def main():
+    runner = await start_health_server()
+    await set_commands()
+    asyncio.create_task(reminder_loop())
+    log.info("Бот запущен")
+    try:
+        await dp.start_polling(bot)
+    finally:
+        if runner:
+            await runner.cleanup()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        log.info("Остановлен")
