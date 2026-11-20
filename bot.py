@@ -29,7 +29,11 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, ChatPermissions, BotCommand
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiohttp import web as aio_web
+import ssl
 
+_SSL_CTX = ssl.create_default_context()
+_SSL_CTX.check_hostname = False
+_SSL_CTX.verify_mode = ssl.CERT_NONE
 # ─────────────────────────── конфиг ───────────────────────────
 
 def load_env(path: Path = Path(__file__).with_name(".env")) -> None:
