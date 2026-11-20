@@ -132,8 +132,76 @@ def contains_banned(text: str) -> str | None:
     return None
 
 
+# ─── GigaChat: получение и обновление токена доступа ───
+# GigaChat выдаёт access_token на 30 минут. Держим его в памяти
+# и обновляем заранее.
+_giga_token: dict = {"value": "", "expires": 0}
+
+
+def _giga_is_used() -> bool:
+    return "giga" in (AI_BASE_URL or "").lower()
+
+
+def _giga_credentials() -> str:
+    """GIGACHAT_KEY (готовый Authorization Key) или склейка ID:SECRET."""
+    key = os.getenv("GIGACHAT_KEY", "").strip()
+    if key:
+        return key
+    cid = os.getenv("GIGACHAT_CLIENT_ID", "").strip()
+    sec = os.getenv("GIGACHAT_CLIENT_SECRET", "").strip()
+    if cid and sec:
+        import base64
+        return base64.b64encode(f"{cid}:{sec}".encode()).decode()
+    return AI_API_KEY  # на случай, если ключ положили в AI_API_KEY
+
+
+def _giga_scope() -> str:
+    return os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
+
+
+def get_giga_token(force: bool = False) -> str:
+    """Возвращает действующий access_token, обновляя его при истечении."""
+    import json as _json
+    import time as _time
+    import urllib.parse
+    import urllib.request as _req
+    import uuid
+
+    now = _time.time()
+    if not force and _giga_token["value"] and _giga_token["expires"] > now + 60:
+        return _giga_token["value"]
+
+    auth = _giga_credentials()
+    if not auth:
+        raise RuntimeError("no_credentials")
+
+    data = urllib.parse.urlencode({"scope": _giga_scope()}).encode()
+    request = _req.Request(
+        "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
+        data=data,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "RqUID": str(uuid.uuid4()),
+            "Authorization": f"Basic {auth}",
+        },
+    )
+    with _req.urlopen(request, timeout=30) as resp:
+        payload = _json.loads(resp.read().decode())
+    token = payload.get("access_token", "")
+    if not token:
+        raise RuntimeError("no_token")
+    expires_at = payload.get("expires_at")
+    if isinstance(expires_at, (int, float)) and expires_at > 1e12:
+        expires_at = expires_at / 1000.0
+    _giga_token["value"] = token
+    _giga_token["expires"] = float(expires_at or (now + 1500))
+    log.info("GigaChat: получен новый токен")
+    return token
+
+
 async def ai_reply(prompt: str, history: list[dict] | None = None) -> str:
-    """Запрос к любому OpenAI-совместимому API."""
+    """Запрос к OpenAI-совместимому API или к GigaChat."""
     import json
     import urllib.error
     import urllib.request
@@ -143,28 +211,52 @@ async def ai_reply(prompt: str, history: list[dict] | None = None) -> str:
         messages.extend(history[-10:])
     messages.append({"role": "user", "content": prompt})
 
+    use_giga = _giga_is_used()
+
+    if not AI_API_KEY and not use_giga:
+        return ("ИИ не настроен: не задан AI_API_KEY. "
+                "Откройте Render → Environment и добавьте ключ, либо поставьте AI_ENABLED=0.")
+
     payload = json.dumps({
         "model": AI_MODEL,
         "messages": messages,
         "max_tokens": 600,
-        "temperature": 0.7,
     }).encode()
 
-    req = urllib.request.Request(
-        f"{AI_BASE_URL}/chat/completions",
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {AI_API_KEY}",
+    def build_request(token: str):
+        headers = {
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
-        },
-    )
-    if not AI_API_KEY:
-        return ("ИИ не настроен: не задан AI_API_KEY. "
-                "Откройте Render → Environment и добавьте ключ, либо поставьте AI_ENABLED=0.")
+        }
+        if use_giga:
+            headers["Accept"] = "application/json"
+        return urllib.request.Request(
+            f"{AI_BASE_URL}/chat/completions",
+            data=payload,
+            headers=headers,
+        )
 
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode())
+        token = await asyncio.to_thread(get_giga_token) if use_giga else AI_API_KEY
+    except Exception as e:
+        log.exception("GigaChat auth error")
+        return ("Не удалось авторизоваться в GigaChat. Проверьте GIGACHAT_KEY "
+                "(или GIGACHAT_CLIENT_ID и GIGACHAT_CLIENT_SECRET) в Environment.")
+
+    try:
+        req = build_request(token)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            # токен мог протухнуть раньше времени — обновляем один раз
+            if use_giga and e.code in (401, 403):
+                token = await asyncio.to_thread(get_giga_token, True)
+                req = build_request(token)
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    data = json.loads(resp.read().decode())
+            else:
+                raise
         return data["choices"][0]["message"]["content"].strip()
     except urllib.error.HTTPError as e:
         body = ""
@@ -175,7 +267,7 @@ async def ai_reply(prompt: str, history: list[dict] | None = None) -> str:
         log.error("AI HTTP %s: %s", e.code, body)
         hints = {
             400: "API не принял запрос — скорее всего неверное имя модели AI_MODEL.",
-            401: "Ключ AI_API_KEY неверный или не подходит к этому AI_BASE_URL.",
+            401: "Ключ неверный или не подходит к этому AI_BASE_URL.",
             403: "Доступ запрещён: ключ без прав или модель недоступна для него.",
             404: "Не найдено: проверьте AI_BASE_URL (должен заканчиваться на /v1) и AI_MODEL.",
             429: "Лимит запросов исчерпан. Подождите или смените модель.",
@@ -246,10 +338,18 @@ async def cmd_mute(message: Message, command: CommandObject):
     if not await is_admin(message):
         return
     uid, name = target_user(message)
+    args = (command.args or "").strip()
     if not uid:
-        await message.answer("Ответьте на сообщение нарушителя.")
-        return
-    minutes = int((command.args or str(MUTE_MINUTES)).strip() or MUTE_MINUTES)
+        # в личке реплая нет: /mute <id> [минуты]
+        parts = args.split()
+        if message.chat.type == ChatType.PRIVATE and parts and parts[0].lstrip("-").isdigit():
+            uid = int(parts[0])
+            name = f"user {uid}"
+            args = " ".join(parts[1:])
+        else:
+            await message.answer("Ответьте на сообщение нарушителя.")
+            return
+    minutes = int(args or MUTE_MINUTES)
     until = int(time.time()) + minutes * 60
     await bot.restrict_chat_member(
         message.chat.id, uid,
@@ -303,11 +403,19 @@ async def cmd_ban(message: Message):
 
 
 @router.message(Command("pin"))
-async def cmd_pin(message: Message):
+async def cmd_pin(message: Message, command_obj: CommandObject):
     if not await is_admin(message):
         return
     if not message.reply_to_message:
-        await message.answer("Ответьте на сообщение, которое нужно закрепить.")
+        if (command_obj.args or "").strip():
+            sent = await message.answer(command_obj.args.strip())
+            await bot.pin_chat_message(message.chat.id, sent.message_id)
+            await message.answer("Закреплено.")
+            return
+        await message.answer(
+            "Ответьте на сообщение, которое нужно закрепить, "
+            "или напишите текст: <code>/pin важное объявление</code>"
+        )
         return
     await bot.pin_chat_message(message.chat.id, message.reply_to_message.message_id)
     await message.answer("Закреплено.")
