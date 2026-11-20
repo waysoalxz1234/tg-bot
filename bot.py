@@ -208,7 +208,7 @@ async def ai_reply(prompt: str, history: list[dict] | None = None) -> str:
     """Запрос к OpenAI-совместимому API или к GigaChat."""
     import json
     import urllib.error
-    import urllib.request
+    import urllib.request , context=_SSL_CTX
 
     messages = [{"role": "system", "content": AI_SYSTEM}]
     if history:
