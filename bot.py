@@ -1,43 +1,37 @@
 """
-Универсальный Telegram-бот: ИИ-ответчик + управление группами.
+Telegram-бот: ИИ-ответчик на GigaChat + управление группами.
 
-Возможности:
-  • личный ассистент — отвечает владельцу через ИИ;
-  • в группах: отвечает на упоминания и реплаи, если включён ИИ-режим;
-  • модерация: мат/спам-фильтр, приветствие новичков, антифлуд,
-    запись в mute, кик, выдача правил, закреп;
-  • работает с учётом того, что бот должен быть админом в группе.
-
-Запуск:  .venv/bin/python bot.py
-Конфиг:  .env рядом с файлом (BOT_TOKEN, OWNER_ID, AI_*)
+Конфиг (Render → Environment):
+  BOT_TOKEN        — токен из BotFather
+  OWNER_ID         — ваш ID (/id)
+  GIGACHAT_KEY     — Authorization Key из кабинета GigaChat
+  AI_MODEL         — по умолчанию GigaChat
+  AI_ENABLED       — 1 или 0
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
 import re
+import ssl
 import time
-from datetime import datetime, timedelta
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
 from collections import defaultdict, deque
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message, ChatPermissions, BotCommand
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import BotCommand, ChatPermissions, Message
 from aiohttp import web as aio_web
 
-import ssl
-
-# ─── SSL-контекст для GigaChat (сертификаты Сбера) ───
-_SSL_CTX = ssl.create_default_context()
-_SSL_CTX.check_hostname = False
-_SSL_CTX.verify_mode = ssl.CERT_NONE
-
-# ─────────────────────────── конфиг ───────────────────────────
 
 def load_env(path: Path = Path(__file__).with_name(".env")) -> None:
     if not path.exists():
@@ -49,61 +43,51 @@ def load_env(path: Path = Path(__file__).with_name(".env")) -> None:
         k, v = line.split("=", 1)
         os.environ.setdefault(k.strip(), v.strip())
 
+
 load_env()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
 
 AI_ENABLED = os.getenv("AI_ENABLED", "1") == "1"
-AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-AI_API_KEY = os.getenv("AI_API_KEY", "")
-AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")
+AI_MODEL = os.getenv("AI_MODEL", "GigaChat").strip() or "GigaChat"
 AI_SYSTEM = os.getenv(
     "AI_SYSTEM",
     "Ты — личный секретарь. Отвечай по-русски, кратко и по делу, обращайся на «вы». "
-    "Помогай с планами, делами, заметками и напоминаниями. Если данных не хватает — "
-    "задай один короткий уточняющий вопрос.",
+    "Помогай с планами, делами, заметками и напоминаниями.",
 )
+
+GIGA_OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+GIGA_API_URL = "https://api.giga.chat/v1"
 
 BANNED_WORDS = [w.strip().lower() for w in os.getenv(
-    "BANNED_WORDS",
-    "мат1,мат2,казино,ставки,заработок из дома,криптосигналы",
+    "BANNED_WORDS", "мат1,мат2,казино,ставки",
 ).split(",") if w.strip()]
 
-WELCOME = os.getenv(
-    "WELCOME",
-    "Добро пожаловать, {name}! Прочитайте правила: /rules",
-)
-
-FLOOD_LIMIT = int(os.getenv("FLOOD_LIMIT", "7"))    # сообщений
-FLOOD_WINDOW = int(os.getenv("FLOOD_WINDOW", "10")) # за N секунд
+WELCOME = os.getenv("WELCOME", "Добро пожаловать, {name}! Прочитайте правила: /rules")
+FLOOD_LIMIT = int(os.getenv("FLOOD_LIMIT", "7"))
+FLOOD_WINDOW = int(os.getenv("FLOOD_WINDOW", "10"))
 MUTE_MINUTES = int(os.getenv("MUTE_MINUTES", "10"))
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "16"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
 
 if not BOT_TOKEN:
-    raise SystemExit("BOT_TOKEN не задан — заполните .env (пример в .env.example)")
+    raise SystemExit("BOT_TOKEN не задан")
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-# ─────────────────────────── состояние ───────────────────────────
-
 chat_settings: dict[int, dict] = defaultdict(lambda: {"ai": True})
 flood: dict[tuple[int, int], deque] = defaultdict(lambda: deque(maxlen=50))
 last_msg: dict[tuple[int, int], str] = {}
-
 dialog_history: dict[int, list] = defaultdict(list)
-HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "16"))
 notes: dict[int, list] = defaultdict(list)
 reminders: list[dict] = []
 
-mute_candidates: dict[int, dict] = {}
-
-# ─────────────────────────── утилиты ───────────────────────────
 
 async def is_admin(message: Message, user_id: int | None = None) -> bool:
     uid = user_id or (message.from_user.id if message.from_user else 0)
@@ -117,7 +101,6 @@ async def is_admin(message: Message, user_id: int | None = None) -> bool:
 
 
 def target_user(message: Message) -> tuple[int | None, str]:
-    """Кого касается команда: реплай или аргумент."""
     if message.reply_to_message and message.reply_to_message.from_user:
         u = message.reply_to_message.from_user
         return u.id, u.full_name
@@ -132,51 +115,42 @@ def contains_banned(text: str) -> str | None:
     return None
 
 
-# ─── GigaChat: получение и обновление токена доступа ───
-_giga_token: dict = {"value": "", "expires": 0}
+# ─────────────────────────── GigaChat ───────────────────────────
+
+_giga_token: dict = {"value": "", "expires": 0.0}
+_ssl_ctx = ssl.create_default_context()
+_ssl_ctx.check_hostname = False
+_ssl_ctx.verify_mode = ssl.CERT_NONE
 
 
-def _giga_is_used() -> bool:
-    return "giga" in (AI_BASE_URL or "").lower()
-
-
-def _giga_credentials() -> str:
-    """GIGACHAT_KEY (готовый Authorization Key) или склейка ID:SECRET."""
+def giga_credentials() -> str:
     key = os.getenv("GIGACHAT_KEY", "").strip()
     if key:
         return key
     cid = os.getenv("GIGACHAT_CLIENT_ID", "").strip()
     sec = os.getenv("GIGACHAT_CLIENT_SECRET", "").strip()
     if cid and sec:
-        import base64
         return base64.b64encode(f"{cid}:{sec}".encode()).decode()
-    return AI_API_KEY  # на случай, если ключ положили в AI_API_KEY
+    return os.getenv("AI_API_KEY", "").strip()
 
 
-def _giga_scope() -> str:
-    return os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
+def giga_scope() -> str:
+    return os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS").strip() or "GIGACHAT_API_PERS"
 
 
 def get_giga_token(force: bool = False) -> str:
-    """Возвращает действующий access_token, обновляя его при истечении."""
-    import json as _json
-    import time as _time
-    import urllib.parse
-    import urllib.request as _req
-    import uuid
-
-    now = _time.time()
-    if not force and _giga_token["value"] and _giga_token["expires"] > now + 60:
+    now = time.time()
+    if not force and _giga_token["value"] and _giga_token["expires"] > now + 90:
         return _giga_token["value"]
 
-    auth = _giga_credentials()
+    auth = giga_credentials()
     if not auth:
-        raise RuntimeError("no_credentials")
+        raise RuntimeError("не задан GIGACHAT_KEY")
 
-    data = urllib.parse.urlencode({"scope": _giga_scope()}).encode()
-    request = _req.Request(
-        "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
-        data=data,
+    body = urllib.parse.urlencode({"scope": giga_scope()}).encode()
+    request = urllib.request.Request(
+        GIGA_OAUTH_URL,
+        data=body,
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
@@ -184,11 +158,13 @@ def get_giga_token(force: bool = False) -> str:
             "Authorization": f"Basic {auth}",
         },
     )
-    with _req.urlopen(request, timeout=30, context=_SSL_CTX) as resp:
-        payload = _json.loads(resp.read().decode())
+    with urllib.request.urlopen(request, timeout=30, context=_ssl_ctx) as resp:
+        payload = json.loads(resp.read().decode())
+
     token = payload.get("access_token", "")
     if not token:
-        raise RuntimeError("no_token")
+        raise RuntimeError("GigaChat не выдал access_token")
+
     expires_at = payload.get("expires_at")
     if isinstance(expires_at, (int, float)) and expires_at > 1e12:
         expires_at = expires_at / 1000.0
@@ -198,98 +174,79 @@ def get_giga_token(force: bool = False) -> str:
     return token
 
 
-async def ai_reply(prompt: str, history: list[dict] | None = None) -> str:
-    """Запрос к OpenAI-совместимому API или к GigaChat."""
-    import json
-    import urllib.error
-    import urllib.request
-
-    messages = [{"role": "system", "content": AI_SYSTEM}]
-    if history:
-        messages.extend(history[-10:])
-    messages.append({"role": "user", "content": prompt})
-
-    use_giga = _giga_is_used()
-
-    if not AI_API_KEY and not use_giga:
-        return ("ИИ не настроен: не задан AI_API_KEY. "
-                "Откройте Render → Environment и добавьте ключ, либо поставьте AI_ENABLED=0.")
-
+def _post_chat(token: str, messages: list[dict]) -> str:
     payload = json.dumps({
         "model": AI_MODEL,
         "messages": messages,
         "max_tokens": 600,
     }).encode()
 
-    def build_request(token: str):
-        headers = {
+    request = urllib.request.Request(
+        f"{GIGA_API_URL}/chat/completions",
+        data=payload,
+        headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
-        }
-        if use_giga:
-            headers["Accept"] = "application/json"
-        return urllib.request.Request(
-            f"{AI_BASE_URL}/chat/completions",
-            data=payload,
-            headers=headers,
-        )
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=60, context=_ssl_ctx) as resp:
+        data = json.loads(resp.read().decode())
+    return data["choices"][0]["message"]["content"].strip()
+
+
+async def ai_reply(prompt: str, history: list[dict] | None = None) -> str:
+    messages = [{"role": "system", "content": AI_SYSTEM}]
+    if history:
+        messages.extend(history[-10:])
+    messages.append({"role": "user", "content": prompt})
 
     try:
-        token = await asyncio.to_thread(get_giga_token) if use_giga else AI_API_KEY
+        token = await asyncio.to_thread(get_giga_token)
     except Exception as e:
         log.exception("GigaChat auth error")
-        return f"Не удалось авторизоваться в GigaChat: {type(e).__name__}: {e}"
+        return f"Не удалось авторизоваться в GigaChat: {e}. Проверьте GIGACHAT_KEY."
 
     try:
-        req = build_request(token)
-        try:
-            with urllib.request.urlopen(req, timeout=60, context=_SSL_CTX) as resp:
-                data = json.loads(resp.read().decode())
-        except urllib.error.HTTPError as e:
-            if use_giga and e.code in (401, 403):
-                token = await asyncio.to_thread(get_giga_token, True)
-                req = build_request(token)
-                with urllib.request.urlopen(req, timeout=60, context=_SSL_CTX) as resp:
-                    data = json.loads(resp.read().decode())
-            else:
-                raise
-        return data["choices"][0]["message"]["content"].strip()
+        return await asyncio.to_thread(_post_chat, token, messages)
     except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            try:
+                token = await asyncio.to_thread(get_giga_token, True)
+                return await asyncio.to_thread(_post_chat, token, messages)
+            except Exception:
+                log.exception("GigaChat retry failed")
         body = ""
         try:
             body = e.read().decode("utf-8", "ignore")[:300]
         except Exception:
             pass
-        log.error("AI HTTP %s: %s", e.code, body)
+        log.error("GigaChat HTTP %s: %s", e.code, body)
         hints = {
-            400: "API не принял запрос — скорее всего неверное имя модели AI_MODEL.",
-            401: "Ключ неверный или не подходит к этому AI_BASE_URL.",
-            403: "Доступ запрещён: ключ без прав или модель недоступна для него.",
-            404: "Не найдено: проверьте AI_BASE_URL и AI_MODEL.",
-            429: "Лимит запросов исчерпан. Подождите или смените модель.",
-            500: "Сбой на стороне сервиса ИИ. Попробуйте позже.",
-            502: "Сервис ИИ недоступен. Попробуйте позже.",
-            503: "Сервис ИИ перегружен. Попробуйте позже.",
+            400: "GigaChat не принял запрос — проверьте AI_MODEL.",
+            401: "Ключ GIGACHAT_KEY неверный или истёк.",
+            403: "Доступ запрещён: проверьте GIGACHAT_SCOPE.",
+            404: "Модель не найдена — проверьте AI_MODEL.",
+            429: "Слишком много запросов. Подождите минуту.",
+            500: "Сбой на стороне GigaChat. Попробуйте позже.",
+            503: "GigaChat перегружен. Попробуйте позже.",
         }
-        hint = hints.get(e.code, "Проверьте AI_BASE_URL, AI_API_KEY и AI_MODEL в Environment.")
-        return f"Ошибка ИИ ({e.code}). {hint}"
+        return f"Ошибка ИИ ({e.code}). {hints.get(e.code, 'Проверьте настройки GigaChat.')}"
     except urllib.error.URLError as e:
-        log.error("AI network error: %s", e)
-        return "Нет связи с сервисом ИИ. Проверьте AI_BASE_URL в Environment."
+        log.error("GigaChat network error: %s", e)
+        return "Нет связи с GigaChat. Попробуйте позже."
     except Exception as e:
         log.exception("AI error")
         return f"Не получилось получить ответ: {type(e).__name__}"
 
 
-# ─────────────────────────── команды ───────────────────────────
-
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     if message.chat.type == ChatType.PRIVATE:
         await message.answer(
-            "Привет. Я бот-помощник.\n\n"
+            "Привет. Я бот-помощник на GigaChat.\n\n"
             "В личке просто пишите — отвечу.\n"
-            "В группах: добавьте меня админом и включите режим командой /ai on."
+            "В группах: добавьте меня админом и упоминайте через @."
         )
     else:
         await message.answer("Бот на связи. Команды: /rules, /ai, /id")
@@ -326,7 +283,7 @@ async def cmd_ai(message: Message, command: CommandObject):
         chat_settings[message.chat.id]["ai"] = False
         await message.answer("ИИ-ответы выключены.")
     else:
-        await message.answer(f"ИИ-режим сейчас: {'вкл' if cur else 'выкл'}\nИспользуйте /ai on или /ai off")
+        await message.answer(f"ИИ-режим: {'вкл' if cur else 'выкл'}\n/ai on или /ai off")
 
 
 @router.message(Command("mute"))
@@ -337,19 +294,21 @@ async def cmd_mute(message: Message, command: CommandObject):
     args = (command.args or "").strip()
     if not uid:
         parts = args.split()
-        if message.chat.type == ChatType.PRIVATE and parts and parts[0].lstrip("-").isdigit():
+        if parts and parts[0].lstrip("-").isdigit():
             uid = int(parts[0])
             name = f"user {uid}"
             args = " ".join(parts[1:])
         else:
             await message.answer("Ответьте на сообщение нарушителя.")
             return
-    minutes = int(args or MUTE_MINUTES)
-    until = int(time.time()) + minutes * 60
+    try:
+        minutes = int(args or MUTE_MINUTES)
+    except ValueError:
+        minutes = MUTE_MINUTES
     await bot.restrict_chat_member(
         message.chat.id, uid,
         permissions=ChatPermissions(can_send_messages=False),
-        until_date=until,
+        until_date=int(time.time()) + minutes * 60,
     )
     await message.answer(f"{name} в муте на {minutes} мин.")
 
@@ -365,8 +324,10 @@ async def cmd_unmute(message: Message):
     await bot.restrict_chat_member(
         message.chat.id, uid,
         permissions=ChatPermissions(
-            can_send_messages=True, can_send_media_messages=True,
-            can_send_other_messages=True, can_add_web_page_previews=True,
+            can_send_messages=True,
+            can_send_media_messages=True,
+            can_send_other_messages=True,
+            can_add_web_page_previews=True,
         ),
     )
     await message.answer(f"С {name} мут снят.")
@@ -398,137 +359,26 @@ async def cmd_ban(message: Message):
 
 
 @router.message(Command("pin"))
-async def cmd_pin(message: Message, command_obj: CommandObject):
+async def cmd_pin(message: Message, command: CommandObject):
     if not await is_admin(message):
         return
     if not message.reply_to_message:
-        if (command_obj.args or "").strip():
-            sent = await message.answer(command_obj.args.strip())
+        if (command.args or "").strip():
+            sent = await message.answer(command.args.strip())
             await bot.pin_chat_message(message.chat.id, sent.message_id)
             await message.answer("Закреплено.")
             return
-        await message.answer(
-            "Ответьте на сообщение, которое нужно закрепить, "
-            "или напишите текст: <code>/pin важное объявление</code>"
-        )
+        await message.answer("Ответьте на сообщение или напишите: /pin текст")
         return
     await bot.pin_chat_message(message.chat.id, message.reply_to_message.message_id)
     await message.answer("Закреплено.")
 
 
-# ─────────────────────────── модерация ───────────────────────────
-
-@router.message(F.new_chat_members)
-async def on_join(message: Message):
-    for u in message.new_chat_members:
-        if u.is_bot:
-            continue
-        try:
-            await message.answer(WELCOME.format(name=u.full_name))
-        except Exception:
-            pass
-
-
-@router.message(F.left_chat_member)
-async def on_leave(message: Message):
-    pass
-
-
-@router.message(F.text)
-async def on_text(message: Message):
-    if not message.text or not message.from_user or message.from_user.is_bot:
-        return
-
-    chat_id = message.chat.id
-    uid = message.from_user.id
-    key = (chat_id, uid)
-    text = message.text.strip()
-
-    if text.startswith("/"):
-        return
-
-    # ── 1. стоп-слова в группах
-    if message.chat.type != ChatType.PRIVATE:
-        bad = contains_banned(text)
-        if bad:
-            if await is_admin(message):
-                return
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            await message.answer(
-                f"{message.from_user.full_name}, такие сообщения здесь неуместны.",
-                disable_notification=True,
-            )
-            return
-
-    # ── 2. антифлуд и антиповтор (только группы)
-    if message.chat.type != ChatType.PRIVATE and not await is_admin(message):
-        now = time.time()
-        q = flood[key]
-        q.append(now)
-        while q and now - q[0] > FLOOD_WINDOW:
-            q.popleft()
-        repeated = last_msg.get(key) == text
-        last_msg[key] = text
-
-        if len(q) >= FLOOD_LIMIT or (repeated and len(q) >= 3):
-            try:
-                await bot.restrict_chat_member(
-                    chat_id, uid,
-                    permissions=ChatPermissions(can_send_messages=False),
-                    until_date=int(now) + MUTE_MINUTES * 60,
-                )
-                await message.answer(
-                    f"{message.from_user.full_name} — слишком часто. "
-                    f"Мут на {MUTE_MINUTES} мин."
-                )
-            except Exception:
-                log.warning("не удалось ограничить пользователя")
-            flood[key].clear()
-            return
-
-    # ── 3. ответы ИИ
-    if not AI_ENABLED:
-        return
-
-    if message.chat.type == ChatType.PRIVATE:
-        if OWNER_ID and uid != OWNER_ID:
-            return
-        hist = dialog_history[chat_id]
-        answer = await ai_reply(text, hist)
-        hist.append({"role": "user", "content": text})
-        hist.append({"role": "assistant", "content": answer})
-        if len(hist) > HISTORY_LIMIT * 2:
-            del hist[: len(hist) - HISTORY_LIMIT * 2]
-        await message.answer(answer)
-        return
-
-    if not chat_settings[chat_id]["ai"]:
-        return
-
-    me = await bot.me()
-    addressed = False
-    if message.reply_to_message and message.reply_to_message.from_user:
-        if message.reply_to_message.from_user.id == me.id:
-            addressed = True
-    if f"@{me.username}" in text:
-        addressed = True
-        text = text.replace(f"@{me.username}", "").strip()
-
-    if addressed and text:
-        answer = await ai_reply(text)
-        await message.reply(answer)
-
-
-# ─────────────── секретарь: заметки и напоминания ───────────────
-
 @router.message(Command("note"))
 async def cmd_note(message: Message, command: CommandObject):
     text = (command.args or "").strip()
     if not text:
-        await message.answer("Использование: <code>/note купить хлеб</code>")
+        await message.answer("Использование: /note купить хлеб")
         return
     notes[message.chat.id].append(text)
     await message.answer(f"Записал. Всего заметок: {len(notes[message.chat.id])}")
@@ -549,25 +399,25 @@ async def cmd_delnote(message: Message, command: CommandObject):
     try:
         idx = int((command.args or "").strip())
     except ValueError:
-        await message.answer("Укажите номер заметки: <code>/delnote 2</code>")
+        await message.answer("Укажите номер: /delnote 2")
         return
     items = notes[message.chat.id]
     if 1 <= idx <= len(items):
-        removed = items.pop(idx - 1)
-        await message.answer(f"Удалил: {removed}")
+        await message.answer(f"Удалил: {items.pop(idx - 1)}")
     else:
         await message.answer("Такой заметки нет.")
 
 
 def parse_when(arg: str) -> tuple[int, str] | None:
-    """Понимает: 10m, 2h, 1d, 19:30, или 19:30 20.11"""
     arg = arg.strip()
-    m = re.fullmatch(r"(\d+)([mhd])", arg)
     now = datetime.now()
+
+    m = re.fullmatch(r"(\d+)([mhd])", arg)
     if m:
         num, unit = int(m.group(1)), m.group(2)
         delta = {"m": timedelta(minutes=num), "h": timedelta(hours=num), "d": timedelta(days=num)}[unit]
         return int((now + delta).timestamp()), ""
+
     m = re.fullmatch(r"(\d{1,2}):(\d{2})(?:\s+(\d{1,2})\.(\d{1,2}))?", arg)
     if m:
         hh, mm = int(m.group(1)), int(m.group(2))
@@ -587,8 +437,8 @@ async def cmd_remind(message: Message, command: CommandObject):
     args = (command.args or "").strip()
     if not args or " " not in args:
         await message.answer(
-            "Формат: <code>/remind 30m позвонить маме</code>\n"
-            "Можно так: <code>/remind 19:30 встреча</code> или <code>/remind 19:30 20.11 встреча</code>"
+            "Формат: /remind 30m позвонить маме\n"
+            "Ещё: /remind 19:30 встреча или /remind 19:30 20.11 встреча"
         )
         return
     when_raw, text = args.split(" ", 1)
@@ -616,12 +466,10 @@ async def cmd_reminders(message: Message):
 
 
 async def reminder_loop():
-    """Каждые 20 секунд проверяет, не пора ли что-то напомнить."""
     while True:
         try:
             now = time.time()
-            due = [r for r in reminders if r["when"] <= now]
-            for r in due:
+            for r in [x for x in reminders if x["when"] <= now]:
                 reminders.remove(r)
                 try:
                     await bot.send_message(r["chat_id"], f"Напоминаю: {r['text']}")
@@ -632,10 +480,100 @@ async def reminder_loop():
         await asyncio.sleep(20)
 
 
-# ─────────────────── health-check для Render ───────────────────
+@router.message(F.new_chat_members)
+async def on_join(message: Message):
+    for u in message.new_chat_members:
+        if u.is_bot:
+            continue
+        try:
+            await message.answer(WELCOME.format(name=u.full_name))
+        except Exception:
+            pass
+
+
+@router.message(F.text)
+async def on_text(message: Message):
+    if not message.text or not message.from_user or message.from_user.is_bot:
+        return
+
+    chat_id = message.chat.id
+    uid = message.from_user.id
+    text = message.text.strip()
+
+    if text.startswith("/"):
+        return
+
+    if message.chat.type != ChatType.PRIVATE:
+        if contains_banned(text) and not await is_admin(message):
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            await message.answer(
+                f"{message.from_user.full_name}, такие сообщения здесь неуместны.",
+                disable_notification=True,
+            )
+            return
+
+    if message.chat.type != ChatType.PRIVATE and not await is_admin(message):
+        now = time.time()
+        q = flood[(chat_id, uid)]
+        q.append(now)
+        while q and now - q[0] > FLOOD_WINDOW:
+            q.popleft()
+        repeated = last_msg.get((chat_id, uid)) == text
+        last_msg[(chat_id, uid)] = text
+
+        if len(q) >= FLOOD_LIMIT or (repeated and len(q) >= 3):
+            try:
+                await bot.restrict_chat_member(
+                    chat_id, uid,
+                    permissions=ChatPermissions(can_send_messages=False),
+                    until_date=int(now) + MUTE_MINUTES * 60,
+                )
+                await message.answer(
+                    f"{message.from_user.full_name} — слишком часто. Мут на {MUTE_MINUTES} мин."
+                )
+            except Exception:
+                log.warning("не удалось ограничить пользователя")
+            q.clear()
+            return
+
+    if not AI_ENABLED:
+        return
+
+    if message.chat.type == ChatType.PRIVATE:
+        if OWNER_ID and uid != OWNER_ID:
+            return
+        hist = dialog_history[chat_id]
+        answer = await ai_reply(text, hist)
+        hist.append({"role": "user", "content": text})
+        hist.append({"role": "assistant", "content": answer})
+        if len(hist) > HISTORY_LIMIT * 2:
+            del hist[: len(hist) - HISTORY_LIMIT * 2]
+        await message.answer(answer)
+        return
+
+    if not chat_settings[chat_id]["ai"]:
+        return
+
+    me = await bot.me()
+    addressed = False
+    if message.reply_to_message and message.reply_to_message.from_user:
+        if message.reply_to_message.from_user.id == me.id:
+            addressed = True
+    if me.username and f"@{me.username}" in text:
+        addressed = True
+        text = text.replace(f"@{me.username}", "").strip()
+
+    if addressed and text:
+        answer = await ai_reply(text)
+        await message.reply(answer)
+
 
 async def _health(request):
     return aio_web.Response(text="ok")
+
 
 async def start_health_server():
     port = int(os.getenv("PORT", "0") or 0)
